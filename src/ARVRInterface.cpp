@@ -2,7 +2,6 @@
 // Our main ARVRInterface code for our OpenXR GDNative module
 
 #include "ARVRInterface.h"
-#include "xrmath.h"
 
 typedef struct arvr_data_struct {
 	OpenXRApi *openxr_api;
@@ -14,8 +13,8 @@ godot_string godot_arvr_get_name(const void *p_data) {
 	godot_string ret;
 
 	char name[] = "OpenXR";
-	api->godot_string_new(&ret);
-	api->godot_string_parse_utf8(&ret, name);
+	godot::api->godot_string_new(&ret);
+	godot::api->godot_string_parse_utf8(&ret, name);
 
 	return ret;
 }
@@ -41,6 +40,8 @@ void godot_arvr_set_anchor_detection_is_enabled(void *p_data, bool p_enable){
 godot_bool godot_arvr_is_stereo(const void *p_data) {
 	godot_bool ret;
 
+	// TODO we should check our configuration and see if we are setup for stereo (hmd) or mono output (tablet)
+
 	ret = true;
 
 	return ret;
@@ -50,24 +51,36 @@ godot_bool godot_arvr_is_initialized(const void *p_data) {
 	godot_bool ret;
 	arvr_data_struct *arvr_data = (arvr_data_struct *)p_data;
 
-	ret = arvr_data == NULL ? false : arvr_data->openxr_api != NULL;
+	if (arvr_data == NULL) {
+		ret = false;
+	} else if (arvr_data->openxr_api == NULL) {
+		ret = false;
+	} else {
+		ret = arvr_data->openxr_api->is_initialised();
+	}
 
 	return ret;
 };
 
 godot_bool godot_arvr_initialize(void *p_data) {
-	godot_bool ret;
+	godot_bool ret = false;
 	arvr_data_struct *arvr_data = (arvr_data_struct *)p_data;
 
+	// Doesn't yet exist? create our OpenXR API instance
 	if (arvr_data->openxr_api == NULL) {
 		arvr_data->openxr_api = OpenXRApi::openxr_get_api();
-		if (arvr_data->openxr_api != NULL) {
-			// TODO reset state if necessary
-		};
 	};
 
+	// We (already) have our API instance? cool!
+	if (arvr_data->openxr_api != NULL) {
+		// not initialise
+		arvr_data->openxr_api->initialize();
+
+		// Are we good ?
+		ret = arvr_data->openxr_api->is_initialised();
+	}
+
 	// and return our result
-	ret = arvr_data->openxr_api != NULL;
 	return ret;
 };
 
@@ -75,16 +88,10 @@ void godot_arvr_uninitialize(void *p_data) {
 	arvr_data_struct *arvr_data = (arvr_data_struct *)p_data;
 
 	if (arvr_data->openxr_api != NULL) {
-		// note, this will already be removed as the primary interface
-		// by ARVRInterfaceGDNative
+		// cleanup
+		arvr_data->openxr_api->uninitialize();
 
-		// detach all our divices
-		/*
-		for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
-		  godot_detach_device(arvr_data, i);
-		};
-		*/
-
+		// and release
 		OpenXRApi::openxr_release_api();
 		arvr_data->openxr_api = NULL;
 	};
@@ -100,49 +107,67 @@ godot_vector2 godot_arvr_get_render_targetsize(const void *p_data) {
 		arvr_data->openxr_api->recommended_rendertarget_size(&width, &height);
 		// printf("Render Target size %dx%d\n", width, height);
 
-		api->godot_vector2_new(&size, width, height);
+		godot::api->godot_vector2_new(&size, width, height);
 	} else {
-		api->godot_vector2_new(&size, 500, 500);
+		godot::api->godot_vector2_new(&size, 500, 500);
 	};
 
 	return size;
 };
 
+void set_default_pos(godot_transform *p_transform, godot_real p_world_scale, godot_int p_eye) {
+	godot::Transform *t = (godot::Transform *)p_transform;
+	godot::api->godot_transform_new_identity(p_transform);
+
+	// if we're not tracking, don't put our head on the floor...
+	t->origin.y = 1.5 * p_world_scale;
+
+	// overkill but..
+	if (p_eye == 1) {
+		t->origin.x = 0.03 * p_world_scale;
+	} else if (p_eye == 2) {
+		t->origin.x = -0.03 * p_world_scale;
+	}
+}
+
 godot_transform godot_arvr_get_transform_for_eye(void *p_data, godot_int p_eye, godot_transform *p_cam_transform) {
 	arvr_data_struct *arvr_data = (arvr_data_struct *)p_data;
 	godot_transform transform_for_eye;
-	godot_transform reference_frame = arvr_api->godot_arvr_get_reference_frame();
+	godot_transform reference_frame = godot::arvr_api->godot_arvr_get_reference_frame();
 	godot_transform ret;
-	godot_real world_scale = arvr_api->godot_arvr_get_worldscale();
+	godot_real world_scale = godot::arvr_api->godot_arvr_get_worldscale();
 
-	if (p_eye == 0) {
-		// this is used for head positioning, it should return the position center between the eyes
-		if (!arvr_data->openxr_api->get_head_center(world_scale, &transform_for_eye)) {
-			api->godot_transform_new_identity(&transform_for_eye);
-		}
-	} else if (arvr_data->openxr_api != NULL) {
-		// printf("Get view matrix for eye %d\n", p_eye);
-		if (p_eye == 1) {
-			if (!arvr_data->openxr_api->get_view_transform(0, world_scale, &transform_for_eye)) {
-				api->godot_transform_new_identity(&transform_for_eye);
-			}
-		} else if (p_eye == 2) {
-			if (!arvr_data->openxr_api->get_view_transform(1, world_scale, &transform_for_eye)) {
-				api->godot_transform_new_identity(&transform_for_eye);
+	if (arvr_data->openxr_api != NULL) {
+		if (p_eye == 0) {
+			// this is used for head positioning, it should return the position center between the eyes
+			if (!arvr_data->openxr_api->get_head_center(world_scale, &transform_for_eye)) {
+				set_default_pos(&transform_for_eye, world_scale, p_eye);
 			}
 		} else {
-			// TODO does this ever happen?
-			api->godot_transform_new_identity(&transform_for_eye);
-			printf("matrix for eye %d: no\n", p_eye);
+			// printf("Get view matrix for eye %d\n", p_eye);
+			if (p_eye == 1) {
+				if (!arvr_data->openxr_api->get_view_transform(0, world_scale, &transform_for_eye)) {
+					set_default_pos(&transform_for_eye, world_scale, p_eye);
+				}
+			} else if (p_eye == 2) {
+				if (!arvr_data->openxr_api->get_view_transform(1, world_scale, &transform_for_eye)) {
+					set_default_pos(&transform_for_eye, world_scale, p_eye);
+				}
+			} else {
+				// TODO does this ever happen?
+				set_default_pos(&transform_for_eye, world_scale, p_eye);
+			}
 		}
+	} else {
+		set_default_pos(&transform_for_eye, world_scale, p_eye);
 	}
 
 	// Now construct our full transform, the order may be in reverse, have
 	// to test
 	// :)
 	ret = *p_cam_transform;
-	ret = api->godot_transform_operator_multiply(&ret, &reference_frame);
-	ret = api->godot_transform_operator_multiply(&ret, &transform_for_eye);
+	ret = godot::api->godot_transform_operator_multiply(&ret, &reference_frame);
+	ret = godot::api->godot_transform_operator_multiply(&ret, &transform_for_eye);
 	return ret;
 };
 
@@ -178,20 +203,21 @@ void godot_arvr_commit_for_eye(void *p_data, godot_int p_eye, godot_rid *p_rende
 	// copy of one of the eyes to the main viewport if p_screen_rect is set,
 	// and only output to the external device if not.
 
-	godot_rect2 screen_rect = *p_screen_rect;
+	godot::Rect2 screen_rect = *(godot::Rect2 *)p_screen_rect;
 
-	if (p_eye == 1 && !api->godot_rect2_has_no_area(&screen_rect)) {
+	if (p_eye == 1 && !screen_rect.has_no_area()) {
 		// blit as mono, attempt to keep our aspect ratio and center our
 		// render buffer
-		godot_vector2 render_size = godot_arvr_get_render_targetsize(p_data);
+		godot_vector2 rs = godot_arvr_get_render_targetsize(p_data);
+		godot::Vector2 *render_size = (godot::Vector2 *)&rs;
 		// printf("Rendersize = %fx%f\n", render_size.x, render_size.y);
 
-		float new_height = screen_rect.size.x * (render_size.y / render_size.x);
+		float new_height = screen_rect.size.x * (render_size->y / render_size->x);
 		if (new_height > screen_rect.size.y) {
 			screen_rect.position.y = (0.5 * screen_rect.size.y) - (0.5 * new_height);
 			screen_rect.size.y = new_height;
 		} else {
-			float new_width = screen_rect.size.y * (render_size.x / render_size.y);
+			float new_width = screen_rect.size.y * (render_size->x / render_size->y);
 
 			screen_rect.position.x = (0.5 * screen_rect.size.x) - (0.5 * new_width);
 			screen_rect.size.x = new_width;
@@ -201,11 +227,13 @@ void godot_arvr_commit_for_eye(void *p_data, godot_int p_eye, godot_rid *p_rende
 		// %0.2f\n",screen_rect.position.x, screen_rect.position.y,
 		// screen_rect.size.x, screen_rect.size.y);
 
-		arvr_api->godot_arvr_blit(0, p_render_target, &screen_rect);
+		// !BAS! We don't have support for this but if keep_3d_linear is true we should tell the blit to do an sRGB conversion or our preview will be too dark.
+
+		godot::arvr_api->godot_arvr_blit(0, p_render_target, (godot_rect2 *)&screen_rect);
 	};
 
 	if (arvr_data->openxr_api != NULL) {
-		uint32_t texid = arvr_api->godot_arvr_get_texid(p_render_target);
+		uint32_t texid = godot::arvr_api->godot_arvr_get_texid(p_render_target);
 		arvr_data->openxr_api->render_openxr(p_eye - 1, texid, arvr_data->has_external_texture_support);
 	};
 };
@@ -223,7 +251,7 @@ void godot_arvr_process(void *p_data) {
 void *godot_arvr_constructor(godot_object *p_instance) {
 	godot_string ret;
 
-	arvr_data_struct *arvr_data = (arvr_data_struct *)api->godot_alloc(sizeof(arvr_data_struct));
+	arvr_data_struct *arvr_data = (arvr_data_struct *)godot::api->godot_alloc(sizeof(arvr_data_struct));
 	arvr_data->openxr_api = NULL;
 
 	return arvr_data;
@@ -238,7 +266,7 @@ void godot_arvr_destructor(void *p_data) {
 			godot_arvr_uninitialize(p_data);
 		}
 
-		api->godot_free(p_data);
+		godot::api->godot_free(p_data);
 	};
 }
 

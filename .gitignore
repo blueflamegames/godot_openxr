@@ -3,9 +3,11 @@
 *.so
 *.dylib
 .import
-*.import
 *.dblite
 *.exp
 *.lib
 *.obj
 logs
+.vscode
+*.pdb
+*.ilk
